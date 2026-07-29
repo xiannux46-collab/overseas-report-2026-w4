@@ -10,12 +10,15 @@ import {
   useEffect,
   useRef,
   useState,
+  type ChangeEvent,
   type ElementType,
   type FormEvent,
 } from "react";
 
 const SUPABASE_URL = "https://vtnoijwrdgabrvnnwedv.supabase.co";
 const SUPABASE_KEY = "sb_publishable_SY72831668qPBSPE8Ts-sw_umcbwN3_";
+const SUPABASE_MEDIA_BUCKET = "weekly-report-media";
+const MAX_VIDEO_BYTES = 50 * 1024 * 1024;
 const DEFAULT_DOCUMENT_ID = "overseas-report-2026-07-week4";
 const LOCAL_REPORT_KEY = "overseas-report-2026-07-week4-local";
 const COLLAB_CONFIG_KEY = "overseas-report-2026-07-week4-collab";
@@ -59,11 +62,23 @@ type Action = {
   deadline: string;
 };
 
+type VideoItem = {
+  id: string;
+  title: string;
+  caption: string;
+  url: string;
+  path: string;
+  size: number;
+  uploadedBy: string;
+  uploadedAt: string;
+};
+
 type SavedReport = {
   content?: ContentMap;
   metrics?: Metrics;
   problems?: Problem[];
   actions?: Action[];
+  videos?: VideoItem[];
 };
 
 const DEFAULT_CONTENT: ContentMap = {
@@ -513,6 +528,7 @@ export default function Home() {
   const [metrics, setMetrics] = useState(DEFAULT_METRICS);
   const [problems, setProblems] = useState(DEFAULT_PROBLEMS);
   const [actions, setActions] = useState(DEFAULT_ACTIONS);
+  const [videos, setVideos] = useState<VideoItem[]>([]);
   const [hydrated, setHydrated] = useState(false);
   const [editing, setEditing] = useState(false);
   const [metricsOpen, setMetricsOpen] = useState(false);
@@ -527,8 +543,11 @@ export default function Home() {
   const [role, setRole] = useState("editor");
   const [onlinePeople, setOnlinePeople] = useState(1);
   const [syncText, setSyncText] = useState("本地自动保存");
+  const [uploadingVideo, setUploadingVideo] = useState(false);
+  const [videoMessage, setVideoMessage] = useState("");
   const clientRef = useRef<SupabaseClient | null>(null);
   const channelRef = useRef<RealtimeChannel | null>(null);
+  const videoInputRef = useRef<HTMLInputElement | null>(null);
   const collaborationRef = useRef({
     connected: false,
     documentId: "",
@@ -583,6 +602,7 @@ export default function Home() {
       if (saved.metrics) setMetrics({ ...DEFAULT_METRICS, ...saved.metrics });
       if (Array.isArray(saved.problems)) setProblems(saved.problems);
       if (Array.isArray(saved.actions)) setActions(saved.actions);
+      if (Array.isArray(saved.videos)) setVideos(saved.videos);
     } catch {
       // Keep the supplied report when local data is malformed.
     }
@@ -593,9 +613,9 @@ export default function Home() {
     if (!hydrated) return;
     localStorage.setItem(
       LOCAL_REPORT_KEY,
-      JSON.stringify({ content, metrics, problems, actions }),
+      JSON.stringify({ content, metrics, problems, actions, videos }),
     );
-  }, [hydrated, content, metrics, problems, actions]);
+  }, [hydrated, content, metrics, problems, actions, videos]);
 
   useEffect(() => {
     if (!hydrated) return;
@@ -627,8 +647,15 @@ export default function Home() {
     nextMetrics = metrics,
     nextProblems = problems,
     nextActions = actions,
+    nextVideos = videos,
   ) {
-    return { content: nextContent, metrics: nextMetrics, problems: nextProblems, actions: nextActions };
+    return {
+      content: nextContent,
+      metrics: nextMetrics,
+      problems: nextProblems,
+      actions: nextActions,
+      videos: nextVideos,
+    };
   }
 
   async function syncField(fieldKey: string, value: string) {
@@ -662,6 +689,11 @@ export default function Home() {
     void syncField("structure:actions", JSON.stringify(next));
   }
 
+  function commitVideos(next: VideoItem[]) {
+    setVideos(next);
+    void syncField("structure:videos", JSON.stringify(next));
+  }
+
   function updateProblem(id: string, field: keyof Problem, value: string) {
     commitProblems(
       problems.map((problem) => (problem.id === id ? { ...problem, [field]: value } : problem)),
@@ -671,6 +703,12 @@ export default function Home() {
   function updateAction(id: string, field: keyof Action, value: string) {
     commitActions(
       actions.map((action) => (action.id === id ? { ...action, [field]: value } : action)),
+    );
+  }
+
+  function updateVideo(id: string, field: "title" | "caption", value: string) {
+    commitVideos(
+      videos.map((video) => (video.id === id ? { ...video, [field]: value } : video)),
     );
   }
 
@@ -724,6 +762,8 @@ export default function Home() {
           setProblems(JSON.parse(value) as Problem[]);
         } else if (fieldKey === "structure:actions") {
           setActions(JSON.parse(value) as Action[]);
+        } else if (fieldKey === "structure:videos") {
+          setVideos(JSON.parse(value) as VideoItem[]);
         }
       } catch {
         setSyncText("收到一条无法解析的远程修改");
@@ -756,6 +796,12 @@ export default function Home() {
         document_id: targetDocumentId,
         field_key: "structure:actions",
         value: JSON.stringify(current.actions),
+        updated_by_name: collaborationRef.current.displayName,
+      },
+      {
+        document_id: targetDocumentId,
+        field_key: "structure:videos",
+        value: JSON.stringify(current.videos),
         updated_by_name: collaborationRef.current.displayName,
       },
     ];
@@ -960,6 +1006,102 @@ export default function Home() {
     URL.revokeObjectURL(url);
   }
 
+  function requestVideoUpload() {
+    setVideoMessage("");
+    if (!online || !clientRef.current) {
+      setConnectError("请先连接在线协作，再上传视频。");
+      setCollabOpen(true);
+      return;
+    }
+    videoInputRef.current?.click();
+  }
+
+  async function handleVideoUpload(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    if (!file.type.startsWith("video/")) {
+      setVideoMessage("请选择 MP4、WebM 或 MOV 视频文件。");
+      return;
+    }
+    if (file.size > MAX_VIDEO_BYTES) {
+      setVideoMessage("单个视频不能超过 50MB，请压缩后再上传。");
+      return;
+    }
+    const client = clientRef.current;
+    const targetDocumentId = collaborationRef.current.documentId;
+    if (!client || !targetDocumentId) {
+      setVideoMessage("在线协作连接已断开，请重新连接后上传。");
+      return;
+    }
+
+    setUploadingVideo(true);
+    setVideoMessage(`正在上传 ${file.name}…`);
+    try {
+      const videoId = makeId("video");
+      const rawExtension = file.name.split(".").pop()?.toLowerCase() || "mp4";
+      const extension = rawExtension.replace(/[^a-z0-9]/g, "") || "mp4";
+      const path = `${targetDocumentId}/${videoId}.${extension}`;
+      const upload = await client.storage
+        .from(SUPABASE_MEDIA_BUCKET)
+        .upload(path, file, {
+          cacheControl: "3600",
+          contentType: file.type,
+          upsert: false,
+        });
+      if (upload.error) throw upload.error;
+
+      const publicUrl = client.storage
+        .from(SUPABASE_MEDIA_BUCKET)
+        .getPublicUrl(path).data.publicUrl;
+      const title = file.name.replace(/\.[^.]+$/, "") || "汇报视频";
+      commitVideos([
+        ...videos,
+        {
+          id: videoId,
+          title,
+          caption: "点击“开启编辑”补充视频说明、结论或需要关注的时间点。",
+          url: publicUrl,
+          path,
+          size: file.size,
+          uploadedBy: collaborationRef.current.displayName,
+          uploadedAt: new Date().toISOString(),
+        },
+      ]);
+      setVideoMessage("上传完成，视频已同步给所有协作者。");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setVideoMessage(
+        /bucket not found/i.test(message)
+          ? "视频存储尚未初始化，请联系发起者完成一次存储设置。"
+          : `上传失败：${message}`,
+      );
+    } finally {
+      setUploadingVideo(false);
+    }
+  }
+
+  async function removeVideo(video: VideoItem) {
+    if (!clientRef.current || !online) {
+      setVideoMessage("请先连接在线协作，再删除云端视频。");
+      return;
+    }
+    setVideoMessage("正在删除视频…");
+    const result = await clientRef.current.storage
+      .from(SUPABASE_MEDIA_BUCKET)
+      .remove([video.path]);
+    if (result.error) {
+      setVideoMessage(`删除失败：${result.error.message}`);
+      return;
+    }
+    commitVideos(videos.filter((item) => item.id !== video.id));
+    setVideoMessage("视频已删除并同步。");
+  }
+
+  function formatFileSize(bytes: number) {
+    return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  }
+
   const scatterPoints = [
     {
       name: "全平台",
@@ -1025,12 +1167,22 @@ export default function Home() {
           </div>
         </div>
         <div className="workbench-actions">
+          <input
+            ref={videoInputRef}
+            className="video-file-input"
+            type="file"
+            accept="video/mp4,video/webm,video/quicktime"
+            onChange={handleVideoUpload}
+          />
           <button className={editing ? "active" : ""} onClick={() => setEditing(!editing)}>
             {editing ? "完成编辑" : "开启编辑"}
           </button>
           <button onClick={() => setMetricsOpen(true)}>编辑数据</button>
           <button onClick={addProblem}>新增问题</button>
           <button onClick={addAction}>新增行动</button>
+          <button onClick={requestVideoUpload} disabled={uploadingVideo}>
+            {uploadingVideo ? "视频上传中…" : "上传视频"}
+          </button>
           <button className="primary" onClick={() => setCollabOpen(true)}>
             {online ? "协作设置" : "连接在线协作"}
           </button>
@@ -1392,8 +1544,68 @@ export default function Home() {
         />
       </section>
 
-      <section className="section diagnosis-section">
+      <section className="section media-section">
         <div className="section-index">05</div>
+        <div className="section-heading">
+          <div>
+            <span className="kicker">VIDEO EVIDENCE</span>
+            <h2>视频素材与案例复盘</h2>
+          </div>
+          <span className="section-aside">在线上传 · 多人同步 · 外部可播放</span>
+        </div>
+        {videos.length > 0 ? (
+          <div className="video-grid">
+            {videos.map((video) => (
+              <article className="video-card" key={video.id}>
+                <video controls preload="metadata" src={video.url}>
+                  当前浏览器不支持视频播放。
+                </video>
+                <div className="video-copy">
+                  <Editable
+                    as="h3"
+                    fieldKey={`${video.id}:title`}
+                    value={video.title}
+                    editing={editing}
+                    onCommit={(_, value) => updateVideo(video.id, "title", value)}
+                  />
+                  <Editable
+                    as="p"
+                    fieldKey={`${video.id}:caption`}
+                    value={video.caption}
+                    editing={editing}
+                    onCommit={(_, value) => updateVideo(video.id, "caption", value)}
+                  />
+                  <div className="video-meta">
+                    <span>{formatFileSize(video.size)}</span>
+                    <span>上传人：{video.uploadedBy || "协作者"}</span>
+                    <span>{new Date(video.uploadedAt).toLocaleDateString("zh-CN")}</span>
+                  </div>
+                  {editing && (
+                    <button className="delete-button" onClick={() => void removeVideo(video)}>
+                      删除视频
+                    </button>
+                  )}
+                </div>
+              </article>
+            ))}
+          </div>
+        ) : (
+          <div className="video-empty">
+            <span>VIDEO</span>
+            <strong>这里还没有视频</strong>
+            <p>连接在线协作后，可从电脑或手机选择视频上传，所有成员会同步看到。</p>
+          </div>
+        )}
+        <div className="video-upload-row" data-print-hide>
+          <button onClick={requestVideoUpload} disabled={uploadingVideo}>
+            {uploadingVideo ? "正在上传，请稍候…" : "＋ 选择并上传视频"}
+          </button>
+          <span>{videoMessage || "支持 MP4、WebM、MOV，单个视频不超过 50MB。"}</span>
+        </div>
+      </section>
+
+      <section className="section diagnosis-section">
+        <div className="section-index">06</div>
         <div className="section-heading">
           <div>
             <span className="kicker">DIAGNOSIS TO ACTION</span>
@@ -1489,7 +1701,7 @@ export default function Home() {
       </section>
 
       <section className="section">
-        <div className="section-index">06</div>
+        <div className="section-index">07</div>
         <div className="section-heading">
           <div>
             <span className="kicker">NEXT ACTIONS</span>
@@ -1554,7 +1766,7 @@ export default function Home() {
       </section>
 
       <section className="section closing-grid">
-        <div className="section-index">07</div>
+        <div className="section-index">08</div>
         <article>
           <span className="kicker">FURTHER QUESTIONS</span>
           <h2>明天汇报后需要继续追问</h2>
